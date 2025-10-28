@@ -1,0 +1,6 @@
+aiohttp
+asyncio
+redis
+pytest
+locust
+flask

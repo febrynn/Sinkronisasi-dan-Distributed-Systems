@@ -1,0 +1,62 @@
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7.2
+    container_name: redis_state
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    networks:
+      - distributed_net
+
+  lock_node_1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.node
+    container_name: lock_node_1
+    environment:
+      - REDIS_HOST=redis_state
+      - NODE_ID=node_1
+    ports:
+      - "5001:5001"
+    networks:
+      - distributed_net
+    depends_on:
+      - redis
+    command: python -m src.app node_1 5001 node_2:5002 node_3:5003
+
+  lock_node_2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.node
+    container_name: lock_node_2
+    environment:
+      - REDIS_HOST=redis_state
+      - NODE_ID=node_2
+    ports:
+      - "5002:5002"
+    networks:
+      - distributed_net
+    depends_on:
+      - redis
+    command: python -m src.app node_2 5002 node_1:5001 node_3:5003
+
+  lock_node_3:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.node
+    container_name: lock_node_3
+    environment:
+      - REDIS_HOST=redis_state
+      - NODE_ID=node_3
+    ports:
+      - "5003:5003"
+    networks:
+      - distributed_net
+    depends_on:
+      - redis
+    command: python -m src.app node_3 5003 node_1:5001 node_2:5002
+
+networks:
+  distributed_net:
+    driver: bridge
