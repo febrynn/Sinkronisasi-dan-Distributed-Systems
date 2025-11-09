@@ -4,10 +4,10 @@ import os
 import aiohttp
 from aiohttp import web
 import json
-import redis.asyncio as redis # Menggunakan redis.asyncio untuk kompatibilitas
-from abc import ABC, abstractmethod # Import ABC dan abstractmethod
+import redis.asyncio as redis
+from abc import ABC, abstractmethod
 
-class BaseNode(ABC): # Warisi dari ABC (Abstract Base Class)
+class BaseNode(ABC):
 
     def __init__(self, node_id: str, port: int, peers: dict):
         self.node_id = node_id
@@ -30,7 +30,7 @@ class BaseNode(ABC): # Warisi dari ABC (Abstract Base Class)
         try:
             data = await request.json()
             # Panggil method handle_message_rpc yang HARUS diimplementasikan di subclass
-            response_data = await self.handle_message_rpc(request, data)
+            response_data = await self.handle_message_rpc(data)
             
             if isinstance(response_data, dict):
                 return web.json_response({"status": "OK", "data": response_data})
@@ -44,7 +44,7 @@ class BaseNode(ABC): # Warisi dari ABC (Abstract Base Class)
             return web.json_response({"status": "ERROR", "message": str(e)}, status=500)
     
     @abstractmethod
-    async def handle_message_rpc(self, request, data: dict):
+    async def handle_message_rpc(self, data: dict):
         """
         METHOD ABSTRAK: Harus diimplementasikan oleh subclass (RaftNode, PBFTNode, dll.).
         Bertanggung jawab untuk memproses pesan RPC spesifik (RequestVote, AppendEntries, dll.).
@@ -55,17 +55,21 @@ class BaseNode(ABC): # Warisi dari ABC (Abstract Base Class)
         """Mengirimkan RPC (Remote Procedure Call) ke node peer."""
         host, port = self.peers.get(target_key, (None, None))
         if not host or not port:
-            return {"error": f"Peer {target_key} tidak ditemukan"}, 404
+            return {"error": f"Peer {target_key} tidak ditemukan"}
 
         url = f"http://{host}:{port}{endpoint}"
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=data) as response:
-                    return await response.json(), response.status
+                async with session.post(url, json=data, timeout=aiohttp.ClientTimeout(total=2.0)) as response:
+                    result = await response.json()
+                    # Return hanya data, bukan tuple
+                    return result.get("data", result)
         except aiohttp.ClientConnectorError as e:
-            return {"error": f"Koneksi gagal ke {target_key} di {host}:{port}. Error: {e}"}, 503
+            return {"error": f"Koneksi gagal ke {target_key} di {host}:{port}"}
+        except asyncio.TimeoutError:
+            return {"error": f"Timeout connecting to {target_key}"}
         except Exception as e:
-            return {"error": f"Gagal mengirim RPC ke {target_key}. Error: {e}"}, 500
+            return {"error": f"Gagal mengirim RPC ke {target_key}: {str(e)}"}
 
     async def broadcast_rpc(self, endpoint: str, data: dict, exclude_self=True):
         """Mengirimkan RPC ke semua peer secara bersamaan."""

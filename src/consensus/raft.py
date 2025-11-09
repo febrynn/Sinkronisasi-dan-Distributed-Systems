@@ -3,14 +3,19 @@ import random
 import time
 import json
 from aiohttp import web
+import sys
+import aiohttp
+import os
 
-from src.nodes.base_node import BaseNode
-from src.nodes.lock_manager import LockManager
+# Memastikan kita dapat mengimpor dari parent
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from nodes.base_node import BaseNode
+from nodes.lock_manager import LockManager
 
 # Konstanta waktu (ms)
-ELECTION_TIMEOUT_MIN = 300
-ELECTION_TIMEOUT_MAX = 600
-HEARTBEAT_INTERVAL = 150
+ELECTION_TIMEOUT_MIN = 1000
+ELECTION_TIMEOUT_MAX = 2000
+HEARTBEAT_INTERVAL = 300
 CLIENT_TIMEOUT = 5.0
 
 # Kunci untuk persistent state
@@ -38,340 +43,305 @@ class RaftNode(BaseNode):
         self.commit_index = -1
         self.last_applied = -1
         self.leader_id = None
+        
+        # Lock manager untuk state machine (volatile)
+        self.state_machine = LockManager()
+        self.lock_manager = self.state_machine
 
         # State untuk leader
-        self.next_index = {p: 0 for p in peers}
+        self.next_index = {p: 0 for p in peers} 
         self.match_index = {p: -1 for p in peers}
-
-        # Komponen tambahan
-        self.lock_manager = LockManager()
-        self.pending_futures = {}
-
-        # Timer election
-        self.election_task = None
+        
+        # State untuk election
+        self.election_timer = None
         self.heartbeat_task = None
-        self.reset_election_timer()
+        self._next_election_timeout()
 
-        # Daftarkan endpoint RPC
+        # Muat state persisten dari Redis (sinkron di init)
+        asyncio.run(self._load_persistent_state())
+
+
+    def _next_election_timeout(self):
+        """Menghitung election timeout acak antara MIN dan MAX (dalam detik)."""
+        self.election_timeout = random.randrange(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX) / 1000.0
+        self.last_contact_time = time.time()
+
+
+    async def _load_persistent_state(self):
+        """Memuat current_term, voted_for, dan log dari Redis."""
         try:
-            self.app.router.add_post("/message", self.handle_rpc_request)
-        except Exception:
-            pass
+            # Muat Term
+            term_str = await self.redis_client.get(KEY_TERM)
+            if term_str:
+                self.current_term = int(term_str)
+            
+            # Muat Voted For
+            voted_for_bytes = await self.redis_client.get(KEY_VOTED_FOR)
+            self.voted_for = voted_for_bytes.decode('utf-8') if voted_for_bytes else None
 
-        print(f"[{self.node_id}] RaftNode initialized as {self.state}")
-
-    # -------------------------
-    # Utilities
-    # -------------------------
-    def reset_election_timer(self):
-        self.election_timeout = random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX) / 1000.0
-        self.last_heartbeat = time.time()
-
-    def get_leader_address(self):
-        if not self.leader_id:
-            return (None, None)
-        return self.peers.get(self.leader_id, (None, None))
-
-    async def load_persistent_state(self):
-        try:
-            if hasattr(self, "redis_client") and self.redis_client:
-                term = await self.redis_client.get(KEY_TERM)
-                if term:
-                    self.current_term = int(term)
-                voted = await self.redis_client.get(KEY_VOTED_FOR)
-                if voted and voted.decode():
-                    self.voted_for = voted.decode()
-                log_data = await self.redis_client.get(KEY_LOG)
-                if log_data:
-                    self.log = json.loads(log_data)
-            print(f"[{self.node_id}] Loaded persistent state: term={self.current_term}, log_len={len(self.log)}")
+            print(f"[{self.node_id}] Persistent state loaded: Term={self.current_term}, VotedFor={self.voted_for}")
         except Exception as e:
-            print(f"[{self.node_id}] Failed loading persistent state: {e}")
+            print(f"[{self.node_id}] ERROR loading persistent state: {e}")
 
     async def save_persistent_state(self):
+        """Menyimpan current_term, voted_for, dan log ke Redis."""
         try:
-            if hasattr(self, "redis_client") and self.redis_client:
-                await self.redis_client.set(KEY_TERM, str(self.current_term))
-                await self.redis_client.set(KEY_VOTED_FOR, self.voted_for or "")
-                await self.redis_client.set(KEY_LOG, json.dumps(self.log))
+            await self.redis_client.set(KEY_TERM, self.current_term)
+            await self.redis_client.set(KEY_VOTED_FOR, self.voted_for if self.voted_for else "")
         except Exception as e:
-            print(f"[{self.node_id}] Failed saving persistent state: {e}")
-
-    # -------------------------
-    # RPC entry points
-    # -------------------------
-    async def handle_message_rpc(self, message):
+            print(f"[{self.node_id}] ERROR saving persistent state: {e}")
+            
+    async def get_queue_status(self):
+        """Mengembalikan statistik queue untuk monitoring cluster."""
         try:
-            data = await message.json() if not isinstance(message, dict) else message
-        except Exception:
-            data = message
-        return await self.handle_message(None, data)
+            # Contoh simulasi queue internal (bisa disesuaikan dengan LockManager/StateMachine kamu)
+            total_messages = len(self.state_machine.queue) if hasattr(self.state_machine, "queue") else 0
+            processed = getattr(self.state_machine, "processed", 0)
+            pending = max(total_messages - processed, 0)
 
-    async def handle_rpc_request(self, request):
-        try:
-            data = await request.json()
-        except Exception:
-            return web.json_response({"error": "invalid json"}, status=400)
+            # Simulasi throughput (kalau belum ada metric real)
+            throughput = f"{total_messages * 10} msg/sec" if total_messages > 0 else "unknown"
 
-        resp = await self.handle_message(request, data)
-        if isinstance(resp, dict):
-            resp["term"] = self.current_term
-        return web.json_response(resp)
+            # Kumpulkan status node lain
+            nodes_status = {}
+            for peer_id, (host, port) in self.peers.items():
+                nodes_status[peer_id] = {
+                    "messages": total_messages // len(self.peers) if self.peers else 0,
+                    "status": "healthy"
+                }
+
+            # Termasuk node ini sendiri
+            nodes_status[self.node_id] = {
+                "messages": total_messages // (len(self.peers) + 1) if self.peers else total_messages,
+                "status": self.role
+            }
+
+            return {
+                "total_messages": total_messages,
+                "processed": processed,
+                "pending": pending,
+                "throughput": throughput,
+                "nodes": nodes_status
+            }
+
+        except Exception as e:
+            print(f"[{self.node_id}] Error in get_queue_status: {e}")
+            return {
+                "total_messages": 0,
+                "processed": 0,
+                "pending": 0,
+                "throughput": "unknown",
+                "nodes": {}
+            }
+
+
 
     # -------------------------
-    # Main loop
+    # State Transition Helpers
     # -------------------------
-    async def run(self):
-        await self.load_persistent_state()
-        await self.start_server()
-        self.reset_election_timer()
-        self._start_election_timer()
-        print(f"[{self.node_id}] Raft core started as {self.state} (term {self.current_term})")
 
-        try:
-            while True:
-                await self.check_and_apply_logs()
-                await asyncio.sleep(0.05)
-        finally:
-            await self._cancel_tasks()
-
-    async def _cancel_tasks(self):
-        for t in [self.election_task, self.heartbeat_task]:
-            if t and not t.done():
-                t.cancel()
-
-    # -------------------------
-    # Election timers
-    # -------------------------
-    def _start_election_timer(self):
-        if self.election_task and not self.election_task.done():
-            self.election_task.cancel()
-        self.election_task = asyncio.create_task(self._election_timeout_loop())
-
-    async def _election_timeout_loop(self):
-        while True:
-            await asyncio.sleep(self.election_timeout)
-            if self.state != "leader" and (time.time() - self.last_heartbeat) >= self.election_timeout:
-                print(f"[{self.node_id}] Election timeout -> start election (term {self.current_term + 1})")
-                await self._start_election()
-            self.election_timeout = random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX) / 1000.0
-
-    def _start_heartbeat_loop(self):
-        if self.heartbeat_task and not self.heartbeat_task.done():
+    async def _become_follower(self, term, leader_id=None):
+        if self.heartbeat_task:
             self.heartbeat_task.cancel()
-        self.heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+            self.heartbeat_task = None
 
-    async def _heartbeat_loop(self):
+        if term > self.current_term:
+            self.current_term = term
+            self.voted_for = None
+            await self.save_persistent_state()
+
+        self.state = "follower"
+        self.leader_id = leader_id
+        self._next_election_timeout()
+        print(f"[{self.node_id}] Transitioned to FOLLOWER, Term {self.current_term}, Leader {self.leader_id}")
+
+    async def _become_candidate(self):
+        """Transisi ke state Candidate dan memulai election."""
+        self.current_term += 1
+        self.state = "candidate"
+        self.voted_for = self.node_id
+        self.leader_id = None
+        self._next_election_timeout()
+        await self.save_persistent_state()
+        
+        print(f"[{self.node_id}] State: CANDIDATE, Term: {self.current_term} - Starting election.")
+        
+        await self._send_request_vote()
+
+    async def _become_leader(self):
+        """Transisi ke state Leader."""
+        self.state = "leader"
+        self.leader_id = self.node_id
+        
+        self.next_index = {p: len(self.log) for p in self.peers}
+        self.match_index = {p: -1 for p in self.peers}
+        
+        print(f"[{self.node_id}] State: LEADER, Term: {self.current_term}")
+        
+        await self._send_append_entries(is_heartbeat=True)
+        
+        self.heartbeat_task = asyncio.create_task(self._leader_heartbeat_loop())
+
+    # -------------------------
+    # Election Logic
+    # -------------------------
+
+    async def _leader_heartbeat_loop(self):
+        """Loop Leader untuk mengirim AppendEntries (Heartbeat) secara berkala."""
         while self.state == "leader":
             await self._send_append_entries(is_heartbeat=True)
             await asyncio.sleep(HEARTBEAT_INTERVAL / 1000.0)
+            
+    async def _send_request_vote(self):
+        """Mengirim RequestVote RPC ke semua peer."""
+        if self.state != "candidate":
+            return
+            
+        votes_received = 1
+        majority = (len(self.peers) + 1) // 2 + 1
+        
+        last_log_index = len(self.log) - 1
+        last_log_term = self.log[last_log_index]['term'] if self.log else 0
 
-    # -------------------------
-    # Election logic
-    # -------------------------
-    async def _start_election(self):
-        self.state = "candidate"
-        self.current_term += 1
-        self.voted_for = self.node_id
-        await self.save_persistent_state()
-        self.vote_count = 1
-        self.leader_id = None
-        self.reset_election_timer()
-        print(f"[{self.node_id}] Became CANDIDATE for term {self.current_term}")
-
-        last_idx = len(self.log) - 1
-        last_term = self.log[last_idx]["term"] if last_idx >= 0 else 0
-        payload = {
+        rpc_data = {
+            "rpc": "RequestVote",
+            "term": self.current_term,
             "candidate_id": self.node_id,
-            "last_log_index": last_idx,
-            "last_log_term": last_term
+            "last_log_index": last_log_index,
+            "last_log_term": last_log_term,
         }
-
-        responses = await self._broadcast_rpc("RequestVote", payload)
-        for r in responses:
-            if isinstance(r, dict) and r.get("term", 0) > self.current_term:
-                await self._step_down(r["term"])
+        
+        responses = await self.broadcast_rpc("/message", rpc_data)
+        
+        for res in responses:
+            if isinstance(res, dict) and res.get("vote_granted"):
+                votes_received += 1
+            
+            if isinstance(res, dict) and res.get("term", 0) > self.current_term:
+                await self._become_follower(res["term"])
                 return
-
-        for r in responses:
-            if isinstance(r, dict) and (r.get("vote_granted") or r.get("voteGranted")):
-                self.vote_count += 1
-
-        total = len(self.peers) + 1
-        majority = total // 2 + 1
-        if self.vote_count >= majority:
-            print(f"[{self.node_id}] Won election (votes={self.vote_count}/{total}), becoming leader")
+        
+        if self.state == "candidate" and votes_received >= majority:
             await self._become_leader()
-        else:
-            print(f"[{self.node_id}] Lost election ({self.vote_count}/{total}). Back to follower.")
-            await self._step_down(self.current_term)
-
-    async def _become_leader(self):
-        self.state = "leader"
-        self.leader_id = self.node_id
-        last_index = len(self.log)
-        for p in self.peers:
-            self.next_index[p] = last_index
-            self.match_index[p] = -1
-        self._start_heartbeat_loop()
-        await self._send_append_entries(is_heartbeat=True)
-        print(f"[{self.node_id}] Became LEADER (term {self.current_term})")
-
-    async def _step_down(self, new_term, leader_id=None):
-        if new_term > self.current_term:
-            self.current_term = new_term
-        self.state = "follower"
-        self.voted_for = None
-        self.leader_id = leader_id
-        await self.save_persistent_state()
-        self.reset_election_timer()
-        print(f"[{self.node_id}] Stepped down to follower. term={self.current_term}, leader={self.leader_id}")
-
+    
     # -------------------------
-    # RPC handlers
+    # Log Replication (AppendEntries)
     # -------------------------
-    async def handle_message(self, request, data):
-        msg_type = data.get("type")
-        incoming_term = data.get("term", 0)
-        if incoming_term > self.current_term:
-            await self._step_down(incoming_term)
+    
+    async def _send_append_entries(self, is_heartbeat: bool):
+        """Mengirim AppendEntries RPC ke semua peer."""
+        if self.state != "leader":
+            return
 
-        if msg_type in ("RequestVote", "request_vote"):
-            return await self.handle_request_vote(data)
-        if msg_type in ("AppendEntries", "append_entries"):
-            return await self.handle_append_entries(data)
-        if msg_type in ("ClientCommand", "client_command"):
-            return await self.handle_client_command(data)
+        for peer_id, _ in self.peers.items():
+            entries_to_send = []
+            prev_log_index = self.next_index[peer_id] - 1
+            prev_log_term = self.log[prev_log_index]['term'] if prev_log_index >= 0 else 0
+            
+            if not is_heartbeat:
+                entries_to_send = self.log[self.next_index[peer_id]:]
 
-        return {"term": self.current_term, "success": False, "message": "unknown rpc type"}
-
-    async def handle_request_vote(self, content):
-        term = content.get("term", self.current_term)
-        candidate = content.get("candidate_id")
-        last_log_index = content.get("last_log_index", -1)
-        last_log_term = content.get("last_log_term", 0)
-        resp = {"term": self.current_term, "vote_granted": False}
-
-        if term < self.current_term:
-            return resp
-
-        if term > self.current_term:
-            await self._step_down(term)
-
-        if self.voted_for is None or self.voted_for == candidate:
-            my_last_term = self.log[-1]["term"] if self.log else 0
-            my_last_index = len(self.log) - 1
-            up_to_date = (last_log_term > my_last_term) or \
-                         (last_log_term == my_last_term and last_log_index >= my_last_index)
-            if up_to_date:
-                self.voted_for = candidate
-                await self.save_persistent_state()
-                self.reset_election_timer()
-                resp["vote_granted"] = True
-                print(f"[{self.node_id}] Voted for {candidate} in term {self.current_term}")
-        return resp
-
-    async def handle_append_entries(self, content):
-        term = content.get("term", self.current_term)
-        leader_id = content.get("leader_id")
-        prev_index = content.get("prev_log_index", -1)
-        prev_term = content.get("prev_log_term", 0)
-        entries = content.get("entries", [])
-        leader_commit = content.get("leader_commit", -1)
-        resp = {"term": self.current_term, "success": False}
-
-        if term < self.current_term:
-            return resp
-
-        if term > self.current_term:
-            await self._step_down(term, leader_id=leader_id)
-        else:
-            self.reset_election_timer()
-            self.leader_id = leader_id
-
-        match = (prev_index == -1) or (0 <= prev_index < len(self.log) and self.log[prev_index]["term"] == prev_term)
-        if not match:
-            return resp
-
-        if entries:
-            next_idx = prev_index + 1
-            for i, ent in enumerate(entries):
-                if next_idx + i < len(self.log):
-                    self.log[next_idx + i] = ent
-                else:
-                    self.log.append(ent)
-            await self.save_persistent_state()
-
-        if leader_commit > self.commit_index:
-            self.commit_index = min(leader_commit, len(self.log) - 1)
-
-        resp["success"] = True
-        resp["match_index"] = len(self.log) - 1
-        return resp
-
-    # -------------------------
-    # Replication helpers
-    # -------------------------
-    async def _send_append_entries(self, is_heartbeat=False):
-        tasks = []
-        for peer in self.peers:
-            next_idx = self.next_index.get(peer, len(self.log))
-            prev_idx = next_idx - 1
-            prev_term = self.log[prev_idx]["term"] if prev_idx >= 0 and prev_idx < len(self.log) else 0
-            entries = self.log[next_idx:]
-
-            content = {
+            rpc_data = {
+                "rpc": "AppendEntries",
+                "term": self.current_term,
                 "leader_id": self.node_id,
-                "prev_log_index": prev_idx,
-                "prev_log_term": prev_term,
-                "entries": entries,
+                "prev_log_index": prev_log_index,
+                "prev_log_term": prev_log_term,
+                "entries": entries_to_send,
                 "leader_commit": self.commit_index
             }
-            tasks.append(self._send_rpc(peer, "AppendEntries", content))
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for peer, r in zip(self.peers.keys(), results):
-            if isinstance(r, dict):
-                if r.get("term", 0) > self.current_term:
-                    await self._step_down(r["term"])
+            asyncio.create_task(self._handle_append_entries_response(peer_id, rpc_data))
+            
+    async def _handle_append_entries_response(self, peer_id, rpc_data):
+        """Memproses respons dari AppendEntries RPC."""
+        response = await self.send_rpc(peer_id, "/message", rpc_data)
+        
+        if isinstance(response, dict):
+            if response.get("term", 0) > self.current_term:
+                await self._become_follower(response["term"])
+                return
+            
+            if response.get("success"):
+                if not rpc_data["entries"]:
                     return
-                if r.get("success"):
-                    match_idx = r.get("match_index", -1)
-                    self.match_index[peer] = max(self.match_index.get(peer, -1), match_idx)
-                    self.next_index[peer] = self.match_index[peer] + 1
-        await self.commit_logs_on_majority()
 
-    async def _send_rpc(self, peer_id, msg_type, content):
-        payload = {**content, "type": msg_type, "term": self.current_term, "sender": self.node_id}
-        try:
-            return await self.send_message(peer_id, payload)
-        except Exception as e:
-            return {"error": str(e)}
+                new_match_index = rpc_data["prev_log_index"] + len(rpc_data["entries"])
+                self.match_index[peer_id] = new_match_index
+                self.next_index[peer_id] = new_match_index + 1
+                
+                self._check_commit_index()
+            else:
+                self.next_index[peer_id] = max(0, self.next_index[peer_id] - 1)
 
-    async def _broadcast_rpc(self, msg_type, content):
-        tasks = [self._send_rpc(peer, msg_type, content) for peer in self.peers]
-        return await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def commit_logs_on_majority(self):
-        N = len(self.log)
-        new_commit = self.commit_index
+    def _check_commit_index(self):
+        """Leader: Cek apakah ada entry baru yang bisa di-commit."""
+        if self.state != "leader":
+            return
+            
         majority = (len(self.peers) + 1) // 2 + 1
-        for idx in range(self.commit_index + 1, N):
-            if self.log[idx]["term"] != self.current_term:
+        
+        for idx in range(len(self.log) - 1, self.commit_index, -1):
+            if self.log[idx]['term'] != self.current_term:
                 continue
+                
             count = 1
-            for p in self.peers:
-                if self.match_index.get(p, -1) >= idx:
+            for peer_id in self.peers:
+                if self.match_index[peer_id] >= idx:
                     count += 1
+            
             if count >= majority:
                 new_commit = idx
-        if new_commit > self.commit_index:
-            self.commit_index = new_commit
-            print(f"[{self.node_id}] Committed up to index {self.commit_index}")
+                
+                if new_commit > self.commit_index:
+                    self.commit_index = new_commit
+                    print(f"[{self.node_id}] Committed up to index {self.commit_index}")
+                    break
+    async def apply_log_entry(self, entry):
+        """Menerapkan satu log entry ke state machine (LockManager)"""
+        try:
+            data = json.loads(entry["command"])
+            op = data.get("op")
+
+            # --- Operasi LOCK ---
+            if op == "lock":
+                result = self.state_machine.acquire_lock(
+                    resource=data["resource"],
+                    client_id=data["client_id"],
+                    lock_type=data.get("type", "exclusive")
+                )
+                print(f"[{self.node_id}] Applied LOCK → {result}")
+
+            # --- Operasi RELEASE ---
+            elif op == "release":
+                result = self.state_machine.release_lock(
+                    resource=data["resource"],
+                    client_id=data["client_id"]
+                )
+                print(f"[{self.node_id}] Applied RELEASE → {result}")
+
+            else:
+                print(f"[{self.node_id}] Unknown op: {op}")
+                result = "Unknown operation"
+
+            return {"success": True, "result": result}
+
+        except Exception as e:
+            print(f"[{self.node_id}] ERROR applying log entry: {e}")
+            return {"success": False, "error": str(e)}
+
 
     # -------------------------
     # Client Commands & Status
     # -------------------------
+    
+    def get_leader_address(self):
+        """Return leader's host and port."""
+        if self.leader_id and self.leader_id in self.peers:
+            return self.peers[self.leader_id]
+        return ("unknown", 0)
+    
     async def handle_client_command(self, content):
         if self.state != "leader":
             host, port = self.get_leader_address()
@@ -381,22 +351,106 @@ class RaftNode(BaseNode):
         self.log.append(entry)
         await self.save_persistent_state()
         idx = len(self.log) - 1
+        
         await self._send_append_entries(is_heartbeat=False)
+        
         return {"success": True, "log_index": idx, "message": "Appended, replication triggered."}
 
     async def get_node_status(self):
-        try:
-            return {
-                "node_id": self.node_id,
-                "role": self.state,  # ✅ fixed
-                "term": self.current_term,
-                "voted_for": self.voted_for,
-                "leader_id": self.leader_id,
-                "commit_index": self.commit_index,
-                "last_applied": self.last_applied,
-                "log_length": len(self.log),
-                "peers": list(self.peers.keys()),
-            }
-        except Exception as e:
-            print(f"[{self.node_id}] ERROR get_node_status: {e}")
-            return {"error": str(e)}
+        """Mengembalikan status node saat ini."""
+        status = {
+            "node_id": self.node_id,
+            "role": self.state,
+            "term": self.current_term,
+            "voted_for": self.voted_for,
+            "leader_id": self.leader_id,
+            "commit_index": self.commit_index,
+            "last_applied": self.last_applied,
+            "log_length": len(self.log),
+            "next_election_timeout": self.election_timeout,
+            "time_since_last_contact": time.time() - self.last_contact_time,
+            "peers": list(self.peers.keys())
+        }
+        return status
+
+    # -------------------------
+    # RPC Handlers
+    # -------------------------
+
+    async def handle_message_rpc(self, data: dict) -> dict:
+        """Handler RPC utama yang memproses RequestVote dan AppendEntries."""
+        rpc_type = data.get("rpc")
+        
+        if data.get("term", 0) > self.current_term:
+            await self._become_follower(data["term"], leader_id=data.get("leader_id"))
+        
+        if data.get("term", 0) < self.current_term:
+            return {"term": self.current_term, "success": False}
+
+        if rpc_type == "RequestVote":
+            return await self._handle_request_vote(data)
+        elif rpc_type == "AppendEntries":
+            if self.state == "follower":
+                 self.leader_id = data.get("leader_id")
+            return await self._handle_append_entries(data)
+        
+        return {"term": self.current_term, "success": False, "message": "Unknown RPC type"}
+
+    async def _handle_request_vote(self, data: dict) -> dict:
+        """Memproses RequestVote RPC dari Candidate."""
+        candidate_id = data.get("candidate_id")
+        candidate_term = data.get("term")
+        
+        vote_granted = False
+        
+        term_ok = (candidate_term == self.current_term and (self.voted_for is None or self.voted_for == candidate_id))
+        
+        last_log_index = len(self.log) - 1
+        last_log_term = self.log[last_log_index]['term'] if last_log_index >= 0 else 0
+        
+        candidate_log_ok = (data["last_log_term"] > last_log_term) or \
+                           (data["last_log_term"] == last_log_term and data["last_log_index"] >= last_log_index)
+
+        if term_ok and candidate_log_ok:
+            self.voted_for = candidate_id
+            await self.save_persistent_state()
+            self.last_contact_time = time.time()
+            vote_granted = True
+            print(f"[{self.node_id}] Voted for {candidate_id} in term {self.current_term}")
+
+        return {"term": self.current_term, "vote_granted": vote_granted}
+
+    async def _handle_append_entries(self, data: dict) -> dict:
+        """Memproses AppendEntries RPC (termasuk Heartbeat)."""
+        leader_id = data.get("leader_id")
+        leader_term = data.get("term")
+        
+        self.last_contact_time = time.time()
+        self.leader_id = leader_id
+
+        if self.state != "follower" and leader_term >= self.current_term:
+            await self._become_follower(leader_term, leader_id)
+        
+        return {"term": self.current_term, "success": True}
+
+    # -------------------------
+    # Core Loop
+    # -------------------------
+
+    async def _raft_loop(self):
+        """Logika inti Raft State Machine."""
+        while True:
+            await asyncio.sleep(0.01)
+            
+            time_since_last_contact = time.time() - self.last_contact_time
+            
+            if self.state != "leader" and time_since_last_contact >= self.election_timeout:
+                self._next_election_timeout()
+                print(f"[{self.node_id}] Election timeout ({self.election_timeout:.3f}s) expired. Initiating election.")
+                await self._become_candidate()
+
+
+    async def run(self):
+        """Memulai AIOHTTP server dan Raft core loop."""
+        await self.start_server()
+        await self._raft_loop()

@@ -53,4 +53,4 @@ class PBFTNode:
         print(f"[{self.node_id}] Broadcast: {msg['type']} to {len(self.peers)} peers.")
         # Simulasikan pengiriman pesan ke peers.
         # Dalam implementasi nyata, ini akan memanggil send_message BaseNode
-        pass 
+    

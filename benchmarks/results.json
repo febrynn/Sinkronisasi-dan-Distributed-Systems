@@ -1,0 +1,23 @@
+{
+    "lock": {
+        "average_lock_ms": 27.54,
+        "operations": 50
+    },
+    "queue": {
+        "avg_enqueue_ms": 43.13,
+        "avg_dequeue_ms": 38.39,
+        "throughput_msg_per_sec": 23.19,
+        "messages_tested": 200
+    },
+    "cache": {
+        "hit_rate_percent": 100.0,
+        "throughput_ops_per_sec": 62.36,
+        "duration_sec": 6.41,
+        "total_operations": 400
+    },
+    "scalability": {
+        "1": 144.44,
+        "2": 185.83,
+        "3": 174.08
+    }
+}
